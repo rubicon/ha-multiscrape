@@ -1,57 +1,59 @@
 """Support for Multiscrape sensors."""
+from __future__ import annotations
+
 import logging
 
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.components.sensor import SensorEntity
-from homeassistant.const import CONF_DEVICE_CLASS
-from homeassistant.const import CONF_FORCE_UPDATE
-from homeassistant.const import CONF_ICON
-from homeassistant.const import CONF_NAME
-from homeassistant.const import CONF_RESOURCE_TEMPLATE
-from homeassistant.const import CONF_UNIQUE_ID
-from homeassistant.const import CONF_UNIT_OF_MEASUREMENT
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor.helpers import async_parse_date_datetime
+from homeassistant.const import (CONF_DEVICE_CLASS, CONF_FORCE_UPDATE,
+                                 CONF_ICON, CONF_NAME, CONF_UNIQUE_ID,
+                                 CONF_UNIT_OF_MEASUREMENT, Platform)
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.entity import async_generate_entity_id
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import slugify
 
 from . import async_get_config_and_coordinator
-from .const import CONF_ON_ERROR_VALUE_DEFAULT
-from .const import CONF_ON_ERROR_VALUE_LAST
-from .const import CONF_ON_ERROR_VALUE_NONE
-from .const import CONF_SENSOR_ATTRS
-from .const import CONF_STATE_CLASS
-from .const import LOG_LEVELS
+from .const import (CONF_ON_ERROR_VALUE_DEFAULT, CONF_ON_ERROR_VALUE_LAST,
+                    CONF_ON_ERROR_VALUE_NONE, CONF_PICTURE, CONF_SENSOR_ATTRS,
+                    CONF_STATE_CLASS, LOG_LEVELS)
 from .entity import MultiscrapeEntity
 from .selector import Selector
 
 _LOGGER = logging.getLogger(__name__)
-ENTITY_ID_FORMAT = SENSOR_DOMAIN + ".{}"
+ENTITY_ID_FORMAT = Platform.SENSOR + ".{}"
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the multiscrape sensor."""
     # Must update the sensor now (including fetching the scraper resource) to
     # ensure it's updating its state.
     if discovery_info is not None:
         conf, coordinator, scraper = await async_get_config_and_coordinator(
-            hass, SENSOR_DOMAIN, discovery_info
+            hass, Platform.SENSOR, discovery_info
         )
     else:
-        _LOGGER.info("Could not find sensor configuration")
+        _LOGGER.info("?? # Could not find sensor configuration")
 
-    if scraper.data is None:
-        if scraper.last_exception:
-            raise PlatformNotReady from scraper.last_exception
+    if not coordinator.last_update_success:
         raise PlatformNotReady
 
-    name = conf.get(CONF_NAME)
+    sensor_name = conf.get(CONF_NAME)
+    _LOGGER.debug("%s # %s # Setting up sensor", scraper.name, sensor_name)
     unique_id = conf.get(CONF_UNIQUE_ID)
     unit = conf.get(CONF_UNIT_OF_MEASUREMENT)
     device_class = conf.get(CONF_DEVICE_CLASS)
     state_class = conf.get(CONF_STATE_CLASS)
     force_update = conf.get(CONF_FORCE_UPDATE)
-    resource_template = conf.get(CONF_RESOURCE_TEMPLATE)
     icon_template = conf.get(CONF_ICON)
+    picture = conf.get(CONF_PICTURE)
 
     sensor_selector = Selector(hass, conf)
     attribute_selectors = {}
@@ -66,13 +68,13 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
                 coordinator,
                 scraper,
                 unique_id,
-                name,
+                sensor_name,
                 unit,
                 device_class,
                 state_class,
                 force_update,
-                resource_template,
                 icon_template,
+                picture,
                 sensor_selector,
                 attribute_selectors,
             )
@@ -94,8 +96,8 @@ class MultiscrapeSensor(MultiscrapeEntity, SensorEntity):
         device_class,
         state_class,
         force_update,
-        resource_template,
         icon_template,
+        picture,
         sensor_selector,
         attribute_selectors,
     ):
@@ -106,9 +108,9 @@ class MultiscrapeSensor(MultiscrapeEntity, SensorEntity):
             scraper,
             name,
             device_class,
-            resource_template,
             force_update,
             icon_template,
+            picture,
             attribute_selectors,
         )
 
@@ -117,32 +119,76 @@ class MultiscrapeSensor(MultiscrapeEntity, SensorEntity):
         )
         self._attr_unique_id = unique_id
         self._attr_state_class = state_class
-        self._attr_unit_of_measurement = unit_of_measurement
+        self._attr_native_unit_of_measurement = unit_of_measurement
 
         self._sensor_selector = sensor_selector
 
     def _update_sensor(self):
         """Update state from the scraper data."""
+        _LOGGER.debug(
+            "%s # %s # Start scraping to update sensor", self.scraper.name, self._name
+        )
+        self._attr_available = True
 
         try:
-            value = self.scraper.scrape(self._sensor_selector)
-            _LOGGER.debug("Sensor %s selected: %s", self._name, value)
-            self._attr_native_value = value
+            if self.coordinator.update_error is True:
+                raise ValueError(
+                    "Skipped scraping because data couldn't be updated")
 
-            if self._icon_template:
-                self._set_icon(value)
+            value = self.scraper.scrape(
+                self._sensor_selector, self._name, variables=self.coordinator.form_variables)
+            _LOGGER.debug(
+                "%s # %s # Selected: %s", self.scraper.name, self._name, value
+            )
+
+            if self.device_class not in {
+                SensorDeviceClass.DATE,
+                SensorDeviceClass.TIMESTAMP,
+            }:
+                self._attr_native_value = value
+
+            else:
+                self._attr_native_value = async_parse_date_datetime(
+                    value, self.entity_id, self.device_class
+                )
         except Exception as exception:
-            _LOGGER.debug("Exception selecting sensor data: %s", exception)
+            self.coordinator.notify_scrape_exception()
 
             if self._sensor_selector.on_error.log not in [False, "false", "False"]:
                 level = LOG_LEVELS[self._sensor_selector.on_error.log]
                 _LOGGER.log(
-                    level, "Sensor %s was unable to extract data from HTML", self._name
+                    level,
+                    "%s # %s # Unable to scrape data: %s \nConsider using debug logging and log_response for further investigation.",
+                    self.scraper.name,
+                    self._name,
+                    exception,
                 )
 
             if self._sensor_selector.on_error.value == CONF_ON_ERROR_VALUE_NONE:
-                self._attr_native_value = None
+                self._attr_available = False
+                _LOGGER.debug(
+                    "%s # %s # On-error, set value to None",
+                    self.scraper.name,
+                    self._name,
+                )
             elif self._sensor_selector.on_error.value == CONF_ON_ERROR_VALUE_LAST:
+                _LOGGER.debug(
+                    "%s # %s # On-error, keep old value: %s",
+                    self.scraper.name,
+                    self._name,
+                    self._attr_native_value,
+                )
+                if self._attr_native_value is None:
+                    self._attr_available = False
                 return
             elif self._sensor_selector.on_error.value == CONF_ON_ERROR_VALUE_DEFAULT:
                 self._attr_native_value = self._sensor_selector.on_error_default
+                _LOGGER.debug(
+                    "%s # %s # On-error, set default value: %s",
+                    self.scraper.name,
+                    self._name,
+                    self._sensor_selector.on_error_default,
+                )
+        # determine icon after exception so it's also set for on_error cases
+        if self._icon_template:
+            self._set_icon(self._attr_native_value)
